@@ -1,0 +1,10 @@
+.env
+venv
+venv/
+
+data/rules/
+data/decoders/
+db/
+db
+test-sigma
+test-sigma/
