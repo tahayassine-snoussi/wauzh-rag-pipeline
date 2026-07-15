@@ -7,18 +7,19 @@ import tempfile
 import os
 import re
 import sys
-
-# -----------------------------
-# Load environment
-# -----------------------------
+from glob import glob
+import xml.etree.ElementTree as ET
+from langchain_core.documents import Document
 
 load_dotenv()
+from google import genai
 
+key = os.getenv("GENAI_API_KEY")
+client = genai.Client(api_key=key)
 
 # -----------------------------
 # Embedding model
 # -----------------------------
-
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2",
     encode_kwargs={
@@ -26,14 +27,10 @@ embedding_model = HuggingFaceEmbeddings(
     }
 )
 
-
 # -----------------------------
 # Chroma database
 # -----------------------------
-
 persistent_directory = "db/chroma_db"
-
-
 db = Chroma(
     persist_directory=persistent_directory,
     embedding_function=embedding_model,
@@ -43,18 +40,9 @@ db = Chroma(
     collection_name="rules_collection"
 )
 
-
-print(
-    "Collection count:",
-    db._collection.count()
-)
-
-
-
 # -----------------------------
 # Sigma -> Wazuh converter
 # -----------------------------
-
 def extract_xml(output):
 
     match = re.search(
@@ -69,7 +57,6 @@ def extract_xml(output):
         )
 
     return match.group(1)
-
 
 def convert_sigma_to_xml(yaml_content):
 
@@ -130,77 +117,55 @@ def convert_sigma_to_xml(yaml_content):
             sigma_file
         )
 
-
-
 # -----------------------------
 # Add parent rules
 # -----------------------------
-
 def add_parent_rules(documents, db):
+    """
+    For each retrieved rule:
+      - Extract its parent rule ID (<if_sid>)
+      - Store the parent ID in the rule metadata
+      - Retrieve the parent rule only once
 
-    enriched_docs = []
+    Returns:
+        parents (dict): {parent_rule_id: parent_document}
+        documents (list): Updated documents with enriched metadata
+    """
 
-
+    parents = {}
     for doc in documents:
 
-
         content = doc.page_content
+        parent_match = re.search(r"<if_sid>(\d+)</if_sid>", content)
 
+        if not parent_match:
+            doc.metadata["parent_rule"] = None
+            continue
 
-        parent_match = re.search(
-            r"<if_sid>(\d+)</if_sid>",
-            content
+        parent_id = parent_match.group(1)
+
+        # Save relationship in metadata
+        doc.metadata["parent_rule"] = parent_id
+
+        # Already retrieved this parent
+        if parent_id in parents:
+            continue
+
+        parent_results = db.similarity_search(
+            "",
+            k=1,
+            filter={
+                "rule_id": parent_id
+            }
         )
+        if parent_results:
+            parents[parent_id] = parent_results[0]
 
-
-        if parent_match:
-
-
-            parent_id = parent_match.group(1)
-
-
-            parent_results = db.similarity_search(
-                "",
-                k=1,
-                filter={
-                    "rule_id": parent_id
-                }
-            )
-
-
-            if parent_results:
-
-
-                parent_rule = parent_results[0].page_content
-
-
-                doc.page_content = f"""
-
-Parent Rule ID: {parent_id}
-
-{parent_rule}
-
-
-====================
-
-Child Rule:
-
-{content}
-
-"""
-
-
-        enriched_docs.append(doc)
-
-
-    return enriched_docs
-
-
+    return parents, documents
 
 # -----------------------------
 # Retriever
 # -----------------------------
-
 retriever = db.as_retriever(
     search_type="similarity_score_threshold",
     search_kwargs={
@@ -209,12 +174,9 @@ retriever = db.as_retriever(
     }
 )
 
-
-
 # -----------------------------
 # Test Sigma rule
 # -----------------------------
-
 yaml_rule = """
 title: SQL Injection Strings In URI
 id: 5513deaf-f49a-46c2-a6c8-3f111b5cb453
@@ -251,107 +213,255 @@ level: high
 """
 
 
-
 # -----------------------------
-# Convert Sigma
+# Load Wazuh decoders
 # -----------------------------
+def load_decoders(decoder_path="data/decoders/*.xml"):
 
-print("\n==============================")
-print("Converting Sigma -> Wazuh")
-print("==============================\n")
+    decoder_index = {}
+
+    for file in glob(decoder_path):
+
+        try:
+
+            with open(
+                file,
+                "r",
+                encoding="utf-8",
+                errors="ignore"
+            ) as f:
+                content = f.read()
 
 
-wazuh_rule = convert_sigma_to_xml(
-    yaml_rule
-)
+            content = re.sub(
+                r"<\?xml.*?\?>",
+                "",
+                content
+            )
 
 
-print(wazuh_rule)
+            content = f"<root>{content}</root>"
 
 
+            root = ET.fromstring(content)
 
+
+        except Exception as e:
+            print(f"Failed parsing {file}: {e}")
+            continue
+
+
+        for decoder in root.findall(".//decoder"):
+
+            name = decoder.get("name")
+
+            if not name:
+                continue
+
+
+            decoder_xml = ET.tostring(
+                decoder,
+                encoding="unicode"
+            )
+
+
+            if name not in decoder_index:
+
+                decoder_index[name] = Document(
+                    page_content=decoder_xml,
+                    metadata={
+                        "decoder_name": name,
+                        "source_file": file
+                    }
+                )
+
+
+    return decoder_index
 # -----------------------------
-# Retrieval
+# Add rule decoder
 # -----------------------------
+def add_decoders(results, decoder_index):
 
-print("\n==============================")
-print("RAG Retrieval")
-print("==============================\n")
+    decoders = {}
+
+    for doc in results:
+
+        decoder_match = re.search(
+            r"<decoded_as>(.*?)</decoded_as>",
+            doc.page_content
+        )
+
+        if not decoder_match:
+            continue
+
+        decoder_name = decoder_match.group(1)
+
+        doc.metadata["decoder"] = decoder_name
+
+        if decoder_name in decoder_index:
+            decoders[decoder_name] = decoder_index[decoder_name]
+
+    return decoders, results
 
 
-results = retriever.invoke(
-    wazuh_rule
-)
+def format_documents(documents, title):
+    """
+    Format a dictionary/list of LangChain Documents
+    into a readable LLM context.
+    """
+
+    output = f"\n===== {title} =====\n"
+
+    if not documents:
+        output += "None found\n"
+        return output
 
 
+    if isinstance(documents, dict):
 
-# Add parent rules
+        for key, doc in documents.items():
 
-results = add_parent_rules(
-    results,
-    db
-)
+            output += f"""
+
+--- {key} ---
+
+Metadata:
+{doc.metadata}
+
+Content:
+{doc.page_content}
+
+"""
+
+    else:
+
+        for doc in documents:
+
+            output += f"""
+
+Metadata:
+{doc.metadata}
+
+Content:
+{doc.page_content}
+
+"""
 
 
+    return output
 
-# -----------------------------
-# Display
-# -----------------------------
 
-for i, doc in enumerate(results, 1):
+def llm_call(results, parents, decoders, wazuh_rule, yaml_rule):
+    
+    rules_context = format_documents(results, "Retrieved Wazuh Rules")
+    parents_context = format_documents(parents, "Parent Rules")
+    decoders_context = format_documents(decoders, "Decoders")
+    prompt = f"""
 
-    print(
-        f"\n========== RESULT {i} ==========\n"
+You are an expert Wazuh detection engineer.
+
+Your task is to improve a Wazuh rule generated automatically from a Sigma rule.
+
+You will receive:
+
+1. The original Sigma rule.
+2. The Wazuh XML rule generated by SigWaz.
+3. Similar Wazuh rules from a knowledge base.
+4. Parent rules referenced through <if_sid>.
+5. Relevant decoders.
+
+Your objective:
+
+- Validate whether the generated Wazuh rule correctly represents the Sigma detection logic.
+- Fix incorrect Wazuh fields.
+- Fix incorrect rule hierarchy.
+- Use existing Wazuh rules as examples.
+- Respect existing parent-child relationships.
+- Verify that referenced decoders support the fields used by the rule.
+- Remove unnecessary elements.
+- Do not invent unsupported Wazuh syntax.
+- Keep the rule compatible with Wazuh XML syntax.
+
+========================
+
+ORIGINAL SIGMA RULE
+
+{yaml_rule}
+
+
+========================
+
+GENERATED WAZUH RULE
+
+{wazuh_rule}
+
+
+{rules_context}
+
+
+{parents_context}
+
+
+{decoders_context}
+
+
+========================
+
+FINAL OUTPUT REQUIREMENTS
+
+Return ONLY the final Wazuh XML rule.
+
+Do not include:
+- explanations
+- markdown
+- comments outside the XML
+- analysis
+
+"""
+
+    interaction = client.interactions.create(
+        model="gemini-3.5-flash",
+        input=prompt
     )
+    print(interaction.output_text)
 
 
-    print(
-        doc.page_content
-    )
+def main():
 
+    print("\n========================")
+    print("Converting Sigma -> Wazuh")
+    print("==========================\n")
+    wazuh_rule = convert_sigma_to_xml(yaml_rule)
+    print(wazuh_rule)
 
-    print(
-        "\nMETADATA:"
-    )
+    print("\n========================")
+    print("RAG Retrieval")
+    print("==========================\n")
+    results = retriever.invoke(wazuh_rule)
 
+    # Add parent rules
+    parents,results = add_parent_rules(results, db)
 
-    print(
-        doc.metadata
-    )
+    # -----------------------------
+    # Display
+    # -----------------------------
+    for i, doc in enumerate(results, 1):
+        print(f"\n====== RESULT {i} ======\n")
+        print(doc.page_content)
+        print("\nMETADATA:")
+        print(doc.metadata)
+    
+    
+    print("\n========================")
+    print("Add decoders")
+    print("==========================\n")
+    decoder_index = load_decoders()
+    decoders, results = add_decoders(results, decoder_index)
 
+    print("\n========================")
+    print("LLM Call")
+    print("==========================\n")
+    llm_call(results, parents, decoders, wazuh_rule, yaml_rule)
 
-
-# -----------------------------
-# Debug similarity scores
-# -----------------------------
-
-print("\n==============================")
-print("Similarity Scores")
-print("==============================\n")
-
-
-scores = db.similarity_search_with_score(
-    wazuh_rule,
-    k=5
-)
-
-
-for doc, score in scores:
-
-    print(
-        "Score:",
-        score
-    )
-
-    print(
-        "Metadata:",
-        doc.metadata
-    )
-
-    print(
-        doc.page_content[:300]
-    )
-
-    print(
-        "---------------------"
-    )
+if __name__ == "__main__":
+    main()
