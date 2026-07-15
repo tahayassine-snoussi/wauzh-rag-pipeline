@@ -230,53 +230,56 @@ def load_decoders(decoder_path="data/decoders/*.xml"):
                 encoding="utf-8",
                 errors="ignore"
             ) as f:
+
                 content = f.read()
 
 
-            content = re.sub(
-                r"<\?xml.*?\?>",
-                "",
-                content
-            )
-
-
-            content = f"<root>{content}</root>"
-
-
-            root = ET.fromstring(content)
-
-
         except Exception as e:
-            print(f"Failed parsing {file}: {e}")
+            print(
+                f"Failed reading {file}: {e}"
+            )
             continue
 
 
-        for decoder in root.findall(".//decoder"):
+        # Extract every decoder block
+        decoder_blocks = re.findall(
+            r"<decoder.*?</decoder>",
+            content,
+            re.DOTALL
+        )
 
-            name = decoder.get("name")
 
-            if not name:
-                continue
+        for block in decoder_blocks:
 
 
-            decoder_xml = ET.tostring(
-                decoder,
-                encoding="unicode"
+            name_match = re.search(
+                r'<decoder name="([^"]+)"',
+                block
             )
 
 
-            if name not in decoder_index:
+            if not name_match:
+                continue
 
-                decoder_index[name] = Document(
-                    page_content=decoder_xml,
-                    metadata={
-                        "decoder_name": name,
-                        "source_file": file
-                    }
-                )
+
+            name = name_match.group(1)
+
+
+            if name in decoder_index:
+                continue
+
+
+            decoder_index[name] = Document(
+                page_content=block,
+                metadata={
+                    "decoder_name": name,
+                    "source_file": file
+                }
+            )
 
 
     return decoder_index
+
 # -----------------------------
 # Add rule decoder
 # -----------------------------
