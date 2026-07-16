@@ -410,6 +410,33 @@ GENERATED WAZUH RULE
 
 ========================
 
+CRITICAL RULE GENERATION CONSTRAINTS
+
+1. GROUP WRAPPER: Every rule MUST be wrapped in a <group name="..."> tag. Do not emit a bare <rule> without a parent <group>. Example: <group name="web,accesslog,sql_injection,"> ... </group>
+
+2. STATIC FIELD TAGS: Wazuh decoders extract certain fields as static internal values. These MUST use their dedicated XML tags and MUST NEVER be wrapped in <field name="...">:
+   - url        -> use <url>          (NEVER <field name="url">)
+   - srcip      -> use <srcip>        (NEVER <field name="srcip">)
+   - dstip      -> use <dstip>        (NEVER <field name="dstip">)
+   - user       -> use <user>         (NEVER <field name="user">)
+   - id         -> use <id>           (NEVER <field name="id">)
+   - protocol   -> use <protocol>     (NEVER <field name="protocol">)
+   - action     -> use <action>      (NEVER <field name="action">)
+   - status     -> use <status>      (NEVER <field name="status">)
+   Using <field name="..."> for any static field causes a fatal error: "Field 'X' is static."
+
+3. NO REDUNDANT FULL_LOG SCOPING: Do NOT emit <field name="full_log"> to establish log type context (e.g., checking for "GET", "POST", "EventID", "ProcessName", etc.). The parent <if_sid> already establishes the event type and source. Adding full_log conditions creates fragile AND logic that often fails due to whitespace, quote handling, or encoding differences in the decoded event, causing the rule to load but never fire silently.
+
+4. SINGLE-LINE REGEX: All PCRE2 patterns inside <url>, <field>, <program_name>, or any other tag MUST be emitted on a single line between the opening and closing tags. Do not insert newlines, indentation, or extra spaces inside the tag content. XML whitespace becomes literal characters in the regex pattern and breaks matching.
+
+5. SAME-FIELD CONDITIONS = AND LOGIC: If you emit multiple tags with the same name (e.g., two <field name="full_log"> tags, or two <url> tags), Wazuh evaluates them as logical AND — all must match. If the Sigma rule represents OR logic across the same field, combine all patterns into a single tag using regex alternation |. Example: <url type="pcre2">pattern1|pattern2|pattern3</url>
+
+6. FIELD NAME VALIDATION: Only use field names that the provided decoders actually extract. If the decoder does not extract a field, do not invent it in <field name="...">. Map Sigma fields to actual Wazuh decoder output fields. When uncertain, use <full_log> as a fallback, but prefer the specific extracted field if it exists.
+
+7. PCRE2 TYPE ATTRIBUTE: When the pattern contains regex metacharacters (., *, +, ?, |, (, ), [, ], ^, $, \s, \d, etc.), you MUST include type="pcre2" on the tag. Without it, Wazuh uses simple substring matching and the metacharacters are treated as literals.
+
+========================
+
 FINAL OUTPUT REQUIREMENTS
 
 Return ONLY the final Wazuh XML rule.
