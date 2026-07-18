@@ -9,3 +9,5 @@ db
 test-sigma
 test-sigma/
 improvements.txt
+logs/
+logs
