@@ -118,7 +118,12 @@ class ValidatorAgent:
     def _get_decoder_by_name(self, decoder_name: str) -> Document | None:
         chroma_filter = build_chroma_filter({"type": "decoder", "decoder_name": decoder_name})
         results = self.db.similarity_search("", k=1, filter=chroma_filter)
-        return results[0] if results else None
+        if results:
+            return results[0]
+        # Check in-memory generated decoders — skip DB existence check
+        if hasattr(self, '_in_memory_decoders') and decoder_name in self._in_memory_decoders:
+            return self._in_memory_decoders[decoder_name]
+        return None
 
     def _find_valid_parent(self, platform: str) -> str | None:
         chroma_filter = build_chroma_filter({"type": "rule", "platform": platform, "has_children": True})
@@ -191,3 +196,10 @@ class ValidatorAgent:
         parent_id = parent_doc.metadata.get("rule_id")
         if parent_id:
             self._in_memory_parents[parent_id] = parent_doc
+
+    def add_in_memory_decoder(self, decoder_doc: Document):
+        if not hasattr(self, '_in_memory_decoders'):
+            self._in_memory_decoders = {}
+        decoder_name = decoder_doc.metadata.get("decoder_name")
+        if decoder_name:
+            self._in_memory_decoders[decoder_name] = decoder_doc

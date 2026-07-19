@@ -415,6 +415,7 @@ level: medium
                     metadata={"type": "decoder", "decoder_name": expected_decoder,
                               "platform": platform, "extracted_fields": extracted_fields}
                 )
+                validator.add_in_memory_decoder(decoders[expected_decoder])  # <-- ADDED
             else:
                 logger.warning(f"Decoder validation failed: {dec_reviews}")
                 expected_decoder = "syslog"
@@ -422,7 +423,6 @@ level: medium
         else:
             expected_decoder = "syslog"
             is_bootstrap = True
-
     elif decoder_doc:
         decoders[expected_decoder] = decoder_doc
         fields = decoder_doc.metadata.get('extracted_fields') or []
