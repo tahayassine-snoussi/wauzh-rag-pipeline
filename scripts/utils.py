@@ -2,7 +2,6 @@
 Shared utilities for the Sigma -> Wazuh pipeline.
 """
 
-
 def build_chroma_filter(filter_dict: dict) -> dict:
     """
     Build ChromaDB-compatible filter from simple key-value pairs.

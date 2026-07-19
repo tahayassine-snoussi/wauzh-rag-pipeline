@@ -11,25 +11,15 @@ from datetime import datetime
 def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     """
     Create a logger with colored console output and file output.
-
-    Args:
-        name: Logger name (e.g., "ingestion", "retrieval", "validator")
-        level: Logging level (DEBUG, INFO, WARNING, ERROR)
-
-    Returns:
-        Configured logger instance
     """
     logger = logging.getLogger(name)
     logger.setLevel(level)
 
-    # Prevent duplicate handlers
     if logger.handlers:
         return logger
 
-    # Ensure logs directory exists
     os.makedirs("logs", exist_ok=True)
 
-    # Console handler with colors
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(level)
 
@@ -53,7 +43,6 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     console_handler.setFormatter(ColoredFormatter())
     logger.addHandler(console_handler)
 
-    # File handler
     file_handler = logging.FileHandler(f"logs/{name}.log", mode="a")
     file_handler.setLevel(level)
     file_formatter = logging.Formatter(
