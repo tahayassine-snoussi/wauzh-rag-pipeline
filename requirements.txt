@@ -1,25 +1,23 @@
-# ───────────────────────────────────────────────
-# LangChain Ecosystem
-# ───────────────────────────────────────────────
+# Wazuh-RAG Pipeline Requirements
+# Core framework for document processing and vector store integration
 langchain-core>=0.2.0
 langchain-community>=0.2.0
 langchain-chroma>=0.1.0
-langchain-text-splitters>=0.2.0
-langchain-openai>=0.1.0
 
-# ───────────────────────────────────────────────
-# Vector Database & Embeddings
-# ───────────────────────────────────────────────
+# Vector database for semantic search
 chromadb>=0.5.0
+
+# Local embedding model (no API key required for embeddings)
 sentence-transformers>=3.0.0
 
-# ───────────────────────────────────────────────
-# LLM Client (Google Gemini)
-# ───────────────────────────────────────────────
-google-genai>=0.1.0
+# Google GenAI SDK for Gemini LLM integration
+google-genai>=0.3.0
 
-# ───────────────────────────────────────────────
-# Utilities
-# ───────────────────────────────────────────────
+# Environment variable management
 python-dotenv>=1.0.0
+
+# YAML parsing for Sigma rules
 PyYAML>=6.0.0
+
+# XML parsing (built-in, but ensure compatibility)
+# lxml>=4.9.0  # Optional: faster XML parsing if needed

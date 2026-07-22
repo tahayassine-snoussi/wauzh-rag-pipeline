@@ -6,9 +6,8 @@ data/rules/
 data/decoders/
 db/
 db
-test-sigma
-test-sigma/
 improvements.txt
 logs/
 logs
-scripts/test.py
+note.txt
+Wazuh_Lab_Verification_Guide.txt
