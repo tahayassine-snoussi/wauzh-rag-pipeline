@@ -10,6 +10,26 @@ Usage:
 Logs:
     logs/ingestion.log  (persistent)
     Console output      (colored, real-time)
+
+FIX (2026-07): Decoder ingestion previously stored only a flat
+`parent_decoder` string per decoder, with no way to query "give me every
+child of X" without either walking every decoder document at retrieval time
+or falling back to embeddings. This meant the retrieval pipeline had no
+reliable, metadata-only way to find e.g. `auditd-syscall` starting from
+`auditd`.
+
+This version adds an explicit decoder-hierarchy pass after all decoders are
+extracted:
+    - root_decoder      -> the top-level ancestor of a decoder (walks the
+                           parent chain all the way up; a root decoder is its
+                           own root)
+    - is_child_decoder  -> True if the decoder declares a <parent>
+    - decoder_depth      -> distance from the root (0 for root decoders,
+                           1 for direct children, 2 for grandchildren, etc.)
+
+A parent -> children map is also built and logged, purely for
+visibility/debugging; the metadata fields above are what retrieval actually
+queries against.
 """
 
 from dotenv import load_dotenv
@@ -175,6 +195,63 @@ def clean_metadata_for_chroma(metadata: dict) -> dict:
         else:
             cleaned[key] = value
     return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Decoder hierarchy processing
+# ---------------------------------------------------------------------------
+
+def compute_decoder_hierarchy(decoder_documents: list[Document]) -> dict[str, list[str]]:
+    """
+    Walk every decoder's <parent> chain to compute:
+        - root_decoder     : top-level ancestor (a root decoder is its own root)
+        - is_child_decoder : True if this decoder declares a <parent>
+        - decoder_depth     : distance from the root (0, 1, 2, ...)
+
+    Mutates each Document's metadata in place, and returns a parent -> children
+    name map for logging/debugging.
+
+    This is what lets retrieval answer "find all children of auditd" purely
+    from metadata filters, with no dependency on embeddings.
+    """
+    name_to_doc = {d.metadata["decoder_name"]: d for d in decoder_documents}
+    parent_to_children: dict[str, list[str]] = {}
+
+    for doc in decoder_documents:
+        name = doc.metadata["decoder_name"]
+        parent = doc.metadata.get("parent_decoder")
+        if parent:
+            parent_to_children.setdefault(parent, []).append(name)
+
+    def resolve_root_and_depth(name: str, seen: frozenset) -> tuple[str, int]:
+        doc = name_to_doc.get(name)
+        if doc is None:
+            # Parent referenced but not present in this ingestion batch —
+            # treat the referenced name itself as the root.
+            return name, 0
+        parent = doc.metadata.get("parent_decoder")
+        if not parent or parent == name or parent in seen:
+            # No parent, self-reference, or a cycle -> stop here, this is root.
+            return name, 0
+        root, depth = resolve_root_and_depth(parent, seen | {name})
+        return root, depth + 1
+
+    for doc in decoder_documents:
+        name = doc.metadata["decoder_name"]
+        parent = doc.metadata.get("parent_decoder")
+        root, depth = resolve_root_and_depth(name, frozenset())
+        doc.metadata["root_decoder"] = root
+        doc.metadata["is_child_decoder"] = bool(parent)
+        doc.metadata["decoder_depth"] = depth
+
+    logger.info("Decoder hierarchy (parent -> children):")
+    if parent_to_children:
+        for parent, children in sorted(parent_to_children.items()):
+            logger.info(f"  {parent}: {children}")
+    else:
+        logger.info("  (no parent/child relationships found)")
+
+    return parent_to_children
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +429,12 @@ def chunk_decoders(decoder_directory: str = "data/decoders") -> list[Document]:
                     metadata=metadata
                 ))
 
+    # ---- Parent hierarchy processing --------------------------------------
+    # Populates root_decoder / is_child_decoder / decoder_depth on every
+    # decoder document so retrieval can find "all children of X" from
+    # metadata alone, without depending on embeddings.
+    compute_decoder_hierarchy(decoder_documents)
+
     logger.info(f"Decoder extraction complete:")
     logger.info(f"  Total decoders: {len(decoder_documents)}")
 
@@ -360,7 +443,12 @@ def chunk_decoders(decoder_directory: str = "data/decoders") -> list[Document]:
     for plat, count in platforms.most_common():
         logger.info(f"    {plat}: {count}")
 
-    with_fields = [(d.metadata["decoder_name"], len(d.metadata["extracted_fields"])) 
+    root_count = sum(1 for d in decoder_documents if not d.metadata["is_child_decoder"])
+    child_count = len(decoder_documents) - root_count
+    logger.info(f"  Root decoders: {root_count}")
+    logger.info(f"  Child decoders: {child_count}")
+
+    with_fields = [(d.metadata["decoder_name"], len(d.metadata["extracted_fields"]))
                    for d in decoder_documents if d.metadata["extracted_fields"]]
     with_fields.sort(key=lambda x: x[1], reverse=True)
     logger.info(f"  Top decoders by extracted fields:")
