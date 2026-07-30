@@ -11,3 +11,6 @@ logs/
 logs
 note.txt
 Wazuh_Lab_Verification_Guide.txt
+
+
+scripts/test.py

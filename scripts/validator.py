@@ -418,12 +418,34 @@ class ValidatorAgent:
             else:
                 logger.info("if_sid: PASS")
 
-        # Check 3: Decoder fields (platform-aware semantic matching)
+        # Check 3: if_matched_sid (NEW)
+        if valid:
+            valid_matched, error = self._validate_if_matched_sid(xml_string)
+            if not valid_matched:
+                self.reviews.append(error)
+            else:
+                logger.info("if_matched_sid: PASS")
+
+        # Check 4: Decoder fields (platform-aware semantic matching)
         valid_fields, error = self._validate_decoder_fields(xml_string, expected_decoder, expected_platform)
         if not valid_fields:
             self.reviews.append(error)
         else:
             logger.info("Decoder fields: PASS")
+
+        # Check 5: Field collisions (NEW)
+        valid_collision, error = self._validate_field_collisions(xml_string)
+        if not valid_collision:
+            self.reviews.append(error)
+        else:
+            logger.info("Field collisions: PASS")
+
+        # Check 6: Child rule purity (NEW)
+        valid_purity, error = self._validate_child_rule_purity(xml_string)
+        if not valid_purity:
+            self.reviews.append(error)
+        else:
+            logger.info("Child rule purity: PASS")
 
         is_valid = len(self.reviews) == 0
         return is_valid, self.reviews
@@ -656,3 +678,78 @@ class ValidatorAgent:
         decoder_name = decoder_doc.metadata.get("decoder_name")
         if decoder_name:
             self._in_memory_decoders[decoder_name] = decoder_doc
+
+
+        # -------------------------------------------------------------------------
+    
+    # NEW VALIDATORS (add these inside ValidatorAgent class)
+    # -------------------------------------------------------------------------
+
+    def _validate_if_matched_sid(self, xml_string: str) -> tuple[bool, str]:
+        if "<if_matched_sid>" not in xml_string:
+            return True, ""
+        has_freq = "<frequency>" in xml_string
+        has_time = "<timeframe>" in xml_string
+        if not has_freq or not has_time:
+            return False, "Child rule with <if_matched_sid> MUST include <frequency> and <timeframe> tags."
+        return True, ""
+
+
+    def _validate_child_rule_purity(self, xml_string: str) -> tuple[bool, str]:
+        has_matched = "<if_matched_sid>" in xml_string
+        has_sid = "<if_sid>" in xml_string
+        if has_matched and has_sid:
+            return False, "Child rule must not contain <if_sid> when using <if_matched_sid>."
+        return True, ""
+
+
+    def _validate_field_collisions(self, xml_string: str) -> tuple[bool, str]:
+        from collections import Counter
+        fields = re.findall(r'<field name="([^"]+)"', xml_string)
+        counts = Counter(fields)
+        for field_name, count in counts.items():
+            if field_name == "audit.exe" and count > 1:
+                return False, f"Rule contains {count} <field name='audit.exe'> tags; Wazuh ANDs them, making the rule impossible."
+        return True, ""
+
+
+    def _validate_category_c_fidelity(self, sigma: dict, generated_rules: list[str | None]) -> tuple[bool, str | None]:
+        """
+        FAIL if a Category C Sigma rule was converted into a single Wazuh rule
+        instead of being split into parent + child rules.
+        """
+        detection = sigma.get("detection", {})
+        has_parent = False
+        has_child = False
+
+        def _scan(obj):
+            nonlocal has_parent, has_child
+            if isinstance(obj, dict):
+                for key in obj.keys():
+                    base = key.split("|")[0]
+                    if base in ("ParentImage", "ParentCommandLine"):
+                        has_parent = True
+                    elif base in ("Image", "CommandLine"):
+                        has_child = True
+                    _scan(obj[key])
+            elif isinstance(obj, list):
+                for item in obj:
+                    _scan(item)
+
+        _scan(detection)
+
+        if has_parent and has_child:
+            # Must produce exactly 2 rules (parent + child) and at least one must have if_matched_sid
+            xmls = [r for r in generated_rules if r]
+            if len(xmls) < 2:
+                return False, (
+                    "Category C fidelity failure: Sigma rule has BOTH parent and child fields "
+                    "but only one Wazuh rule was produced. Must split into parent baseline + child detection."
+                )
+            has_matched = any('<if_matched_sid>' in x for x in xmls)
+            if not has_matched:
+                return False, (
+                    "Category C fidelity failure: child rule must use <if_matched_sid> "
+                    "to correlate with parent baseline."
+                )
+        return True, None
