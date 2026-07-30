@@ -1,0 +1,866 @@
+================================================================================
+  WAZUH LAB - LOG VERIFICATION & TESTING GUIDE
+  Complete Step-by-Step Manual for Agents and Manager
+================================================================================
+
+Author: Your Name
+Date: 2026-07-20
+Purpose: Verify every log source flows correctly from client -> agent -> manager -> dashboard
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+  1. QUICK REFERENCE: KEY FILES & PATHS
+  2. UBUNTU (TOMCAT + APACHE + AUDITD) - AGENT TESTS
+  3. WINDOWS AD (SYSMON + EVENT CHANNEL) - AGENT TESTS
+  4. WAZUH MANAGER - VERIFICATION COMMANDS
+  5. DASHBOARD - SEARCH QUERIES & FILTERS
+  6. MANUAL LOG INJECTION (TESTING WITHOUT REAL ATTACKS)
+  7. SIGMA RULE TESTING WORKFLOW
+  8. TROUBLESHOOTING CHECKLIST
+  9. QUICK COMMAND CHEAT SHEET
+
+================================================================================
+1. QUICK REFERENCE: KEY FILES & PATHS
+================================================================================
+
+--- UBUNTU AGENT ---
+  Agent Config:       /var/ossec/etc/ossec.conf
+  Agent Logs:         /var/ossec/logs/ossec.log
+  Tomcat Access Log:  /var/log/tomcat9/access_log.*
+  Tomcat Error Log:   /var/log/tomcat9/catalina.out
+  Auditd Log:         /var/log/audit/audit.log
+  Restart Agent:      sudo systemctl restart wazuh-agent
+  Agent Status:       sudo systemctl status wazuh-agent
+
+--- WINDOWS AD AGENT ---
+  Agent Config:       C:\Program Files (x86)\ossec-agent\ossec.conf
+  Agent Logs:         C:\Program Files (x86)\ossec-agent\ossec.log
+  Sysmon Log:         Microsoft-Windows-Sysmon/Operational (Event Channel)
+  Security Log:       Security (Event Channel)
+  Restart Agent:      Restart-Service -Name wazuh
+  Agent Status:       Get-Service wazuh
+  Sysmon Service:     Get-Service Sysmon64
+  Sysmon Install:     C:\Sysmon\Sysmon64.exe
+
+--- WAZUH MANAGER ---
+  Manager Config:     /var/ossec/etc/ossec.conf
+  Manager Logs:       /var/ossec/logs/ossec.log
+  All Received Logs:  /var/ossec/logs/archives/archives.json
+  Alert Logs:         /var/ossec/logs/alerts/alerts.json
+  Alert Text Logs:    /var/ossec/logs/alerts/alerts.log
+  Rules Directory:    /var/ossec/etc/rules/
+  Decoders Directory: /var/ossec/etc/decoders/
+  Log Test Tool:      /var/ossec/bin/wazuh-logtest
+  Agent Control:      /var/ossec/bin/agent_control
+  Restart Manager:    sudo systemctl restart wazuh-manager
+  Manager Status:     sudo systemctl status wazuh-manager
+
+--- WAZUH DASHBOARD ---
+  URL:                https://<manager-ip>:5601 (or your configured URL)
+  Security Events:    Modules -> Security Events
+  Agents List:        Management -> Agents
+  Rules:              Management -> Rules
+  Decoders:           Management -> Decoders
+
+================================================================================
+2. UBUNTU (TOMCAT + APACHE + AUDITD) - AGENT TESTS
+================================================================================
+
+--- 2.1 VERIFY TOMCAT ACCESS LOGS ---
+
+STEP 1: Check log file exists and is being written
+------------------------------------------------------------------------
+  COMMAND:
+    ls -la /var/log/tomcat9/localhost_access_log.*
+
+  EXPECTED:
+    Files like: localhost_access_log.2026-07-20.txt
+    Should have recent timestamp
+
+STEP 2: Generate traffic if log is empty
+------------------------------------------------------------------------
+  COMMAND:
+    curl http://localhost:8080/
+    curl http://localhost:8080/manager/html
+    curl http://localhost:8080/examples/servlets/servlet/HelloWorldExample
+
+STEP 3: Verify agent config for Tomcat
+------------------------------------------------------------------------
+  COMMAND:
+    sudo cat /var/ossec/etc/ossec.conf | grep -A 4 "apache"
+
+  EXPECTED OUTPUT:
+    <localfile>
+      <log_format>apache</log_format>
+      <location>/var/log/tomcat9/access_log.*</location>
+    </localfile>
+
+STEP 4: Grab a real log line for testing
+------------------------------------------------------------------------
+  COMMAND:
+    tail -1 /var/log/tomcat9/localhost_access_log.$(date +%Y-%m-%d).txt
+
+  EXAMPLE OUTPUT:
+    192.168.1.100 - - [20/Jul/2026:14:30:00 +0000] "GET /manager/html HTTP/1.1" 401 1234
+
+STEP 5: Test with wazuh-logtest on MANAGER (see Section 4.1)
+------------------------------------------------------------------------
+  Paste the log line from STEP 4 into wazuh-logtest
+
+STEP 6: Live verification on MANAGER
+------------------------------------------------------------------------
+  ON MANAGER, RUN:
+    sudo tail -f /var/ossec/logs/archives/archives.json | grep "apache\|tomcat"
+
+  THEN ON UBUNTU, GENERATE TRAFFIC:
+    curl http://localhost:8080/
+
+  EXPECTED: JSON entries appear in manager within 5-10 seconds
+
+STEP 7: Dashboard verification
+------------------------------------------------------------------------
+  GO TO: Wazuh Dashboard -> Modules -> Security Events
+  SEARCH: location: /var/log/tomcat9/access_log
+  OR:     agent.name: <your-ubuntu-agent-name>
+
+--- 2.2 VERIFY TOMCAT CATALINA.OUT (SYSLOG FORMAT) ---
+
+STEP 1: Check log file exists
+------------------------------------------------------------------------
+  COMMAND:
+    ls -la /var/log/tomcat9/catalina.out
+
+STEP 2: Generate log entries
+------------------------------------------------------------------------
+  COMMAND:
+    sudo systemctl restart tomcat9
+    sudo systemctl status tomcat9
+
+STEP 3: Grab a log line
+------------------------------------------------------------------------
+  COMMAND:
+    tail -5 /var/log/tomcat9/catalina.out
+
+STEP 4: Live verification on MANAGER
+------------------------------------------------------------------------
+  ON MANAGER, RUN:
+    sudo tail -f /var/ossec/logs/archives/archives.json | grep "catalina"
+
+  THEN ON UBUNTU:
+    sudo systemctl restart tomcat9
+
+  EXPECTED: Entries appear in archives.json
+
+STEP 5: Dashboard verification
+------------------------------------------------------------------------
+  SEARCH: location: /var/log/tomcat9/catalina.out
+
+--- 2.3 VERIFY AUDITD PROCESS MONITORING ---
+
+STEP 1: Confirm auditd is running
+------------------------------------------------------------------------
+  COMMAND:
+    sudo systemctl status auditd
+    sudo auditctl -l
+
+  EXPECTED OUTPUT:
+    -a always,exit -F arch=b64 -S execve -k process_monitoring
+
+STEP 2: Generate auditable events
+------------------------------------------------------------------------
+  COMMANDS:
+    whoami
+    ls -la
+    sudo apt update
+    ps aux
+    netstat -tulpn
+
+STEP 3: Check audit logs are being written
+------------------------------------------------------------------------
+  COMMAND:
+    sudo tail -f /var/log/audit/audit.log | grep "process_monitoring"
+
+  EXPECTED OUTPUT (example):
+    type=SYSCALL msg=audit(1721488200.123:12345): arch=c000003e syscall=59 
+    success=yes exit=0 ... comm="whoami" exe="/usr/bin/whoami" key="process_monitoring"
+
+STEP 4: Verify Wazuh reads audit logs
+------------------------------------------------------------------------
+  CHECK IF CONFIGURED:
+    sudo cat /var/ossec/etc/ossec.conf | grep -A 4 "audit"
+
+  IF MISSING, ADD THIS TO ossec.conf:
+    <localfile>
+      <log_format>syslog</log_format>
+      <location>/var/log/audit/audit.log</location>
+    </localfile>
+
+  THEN RESTART AGENT:
+    sudo systemctl restart wazuh-agent
+
+STEP 5: Live verification on MANAGER
+------------------------------------------------------------------------
+  ON MANAGER:
+    sudo tail -f /var/ossec/logs/archives/archives.json | grep "audit\|execve\|whoami"
+
+  THEN ON UBUNTU, RUN:
+    whoami
+
+  EXPECTED: audit entries appear in archives.json
+
+STEP 6: Dashboard verification
+------------------------------------------------------------------------
+  SEARCH: location: /var/log/audit/audit.log
+  OR:     data.audit.key: process_monitoring
+
+================================================================================
+3. WINDOWS AD (SYSMON + EVENT CHANNEL) - AGENT TESTS
+================================================================================
+
+--- 3.1 VERIFY SYSMON IS INSTALLED AND LOGGING ---
+
+STEP 1: Check Sysmon service
+------------------------------------------------------------------------
+  COMMAND (PowerShell - Admin):
+    Get-Service Sysmon64
+    Get-WinEvent -ListLog Microsoft-Windows-Sysmon/Operational
+
+  EXPECTED: Sysmon64 service Running, Log exists and Enabled
+
+STEP 2: Generate Sysmon events
+------------------------------------------------------------------------
+  COMMANDS (PowerShell or CMD):
+    whoami
+    ipconfig /all
+    net user
+    Test-NetConnection -ComputerName 8.8.8.8 -Port 53
+    echo "test" > C:\Users\Public\testfile.txt
+    notepad.exe
+
+STEP 3: View Sysmon events locally
+------------------------------------------------------------------------
+  COMMAND:
+    Get-WinEvent -LogName Microsoft-Windows-Sysmon/Operational -MaxEvents 10 | Format-List
+
+  EXPECTED EVENT IDs:
+    Event ID 1  = ProcessCreate
+    Event ID 3  = NetworkConnect
+    Event ID 7  = ImageLoad
+    Event ID 11 = FileCreate
+
+STEP 4: Verify Wazuh agent config for Sysmon
+------------------------------------------------------------------------
+  COMMAND:
+    Get-Content "C:\Program Files (x86)\ossec-agent\ossec.conf" | Select-String -Context 0,4 "Sysmon"
+
+  EXPECTED OUTPUT:
+    <localfile>
+      <log_format>eventchannel</log_format>
+      <location>Microsoft-Windows-Sysmon/Operational</location>
+    </localfile>
+
+STEP 5: Live verification on MANAGER
+------------------------------------------------------------------------
+  ON MANAGER, RUN:
+    sudo tail -f /var/ossec/logs/archives/archives.json | grep -i "sysmon"
+
+  THEN ON WINDOWS, RUN:
+    whoami
+
+  EXPECTED: Sysmon events appear in archives.json within 10-20 seconds
+
+STEP 6: Dashboard verification
+------------------------------------------------------------------------
+  GO TO: Modules -> Security Events
+  FILTER: location: Microsoft-Windows-Sysmon/Operational
+  OR:     agent.name: <your-windows-agent-name>
+
+--- 3.2 VERIFY SPECIFIC SYSMON EVENT IDs ---
+
+Generate each event and verify it appears:
+
+EVENT ID 1 - Process Creation
+------------------------------------------------------------------------
+  TRIGGER:
+    whoami
+    powershell.exe -Command "Get-Date"
+
+  DASHBOARD SEARCH:
+    data.win.system.eventID: 1 AND agent.name: <windows-agent>
+
+EVENT ID 3 - Network Connection
+------------------------------------------------------------------------
+  TRIGGER:
+    Test-NetConnection -ComputerName 8.8.8.8 -Port 53
+    ping 8.8.8.8
+
+  DASHBOARD SEARCH:
+    data.win.system.eventID: 3 AND agent.name: <windows-agent>
+
+EVENT ID 7 - Image Load (DLL)
+------------------------------------------------------------------------
+  TRIGGER:
+    Run any application (notepad, calc, etc.)
+
+  DASHBOARD SEARCH:
+    data.win.system.eventID: 7 AND agent.name: <windows-agent>
+
+EVENT ID 11 - File Create
+------------------------------------------------------------------------
+  TRIGGER:
+    echo "test" > C:\Users\Public\testfile.txt
+
+  DASHBOARD SEARCH:
+    data.win.system.eventID: 11 AND agent.name: <windows-agent>
+
+--- 3.3 VERIFY WINDOWS SECURITY EVENTS ---
+
+EVENT ID 4625 - Failed Logon (for brute force testing)
+------------------------------------------------------------------------
+  TRIGGER:
+    runas /user:nonexistent cmd
+    # Or RDP with wrong password
+
+  DASHBOARD SEARCH:
+    data.win.system.eventID: 4625 AND agent.name: <windows-agent>
+
+EVENT ID 4624 - Successful Logon
+------------------------------------------------------------------------
+  TRIGGER:
+    Log in normally, or runas with correct credentials
+
+  DASHBOARD SEARCH:
+    data.win.system.eventID: 4624 AND agent.name: <windows-agent>
+
+EVENT ID 4720 - User Account Created
+------------------------------------------------------------------------
+  TRIGGER:
+    net user testuser P@ssw0rd /add
+
+  DASHBOARD SEARCH:
+    data.win.system.eventID: 4720 AND agent.name: <windows-agent>
+
+EVENT ID 1102 - Security Log Cleared
+------------------------------------------------------------------------
+  TRIGGER:
+    wevtutil cl Security
+    # (Requires admin rights)
+
+  DASHBOARD SEARCH:
+    data.win.system.eventID: 1102 AND agent.name: <windows-agent>
+
+================================================================================
+4. WAZUH MANAGER - VERIFICATION COMMANDS
+================================================================================
+
+--- 4.1 TEST RULES WITH WAZUH-LOGTEST ---
+
+PURPOSE: Test any log line against Wazuh decoders and rules WITHOUT running real attacks
+
+COMMAND:
+  sudo /var/ossec/bin/wazuh-logtest
+
+HOW TO USE:
+  1. Copy a real log line from any agent
+  2. Paste it into the terminal
+  3. Press Enter
+  4. Review the output for:
+     - Phase 1: Pre-decoding (timestamp, hostname, program name)
+     - Phase 2: Decoding (extracted fields)
+     - Phase 3: Rules (which rules fired, alert level)
+
+EXAMPLE SESSION (Tomcat access log):
+------------------------------------------------------------------------
+  INPUT:
+    192.168.1.100 - - [20/Jul/2026:14:30:00 +0000] "GET /manager/html HTTP/1.1" 401 1234
+
+  EXPECTED OUTPUT:
+    **Phase 1: Completed pre-decoding.
+        full event: '192.168.1.100 - - [20/Jul/2026:14:30:00 +0000] "GET /manager/html HTTP/1.1" 401 1234'
+        timestamp: '(null)'
+        hostname: '(null)'
+        program_name: '(null)'
+        log: '192.168.1.100 - - [20/Jul/2026:14:30:00 +0000] "GET /manager/html HTTP/1.1" 401 1234'
+
+    **Phase 2: Completed decoding.
+        name: 'web-accesslog'
+        srcip: '192.168.1.100'
+        protocol: 'GET'
+        url: '/manager/html'
+        http_status_code: '401'
+
+    **Phase 3: Completed filtering (rules).
+        id: '31101'
+        level: '5'
+        description: 'Web server 401 unauthorized error.'
+        groups: '["web","accesslog","attack"]'
+        firedtimes: '1'
+        mail: 'false'
+    **Alert to be generated.
+
+PRESS Ctrl+C TO EXIT wazuh-logtest
+
+--- 4.2 MONITOR LIVE LOGS ON MANAGER ---
+
+Monitor ALL incoming logs (including non-alerts):
+------------------------------------------------------------------------
+  COMMAND:
+    sudo tail -f /var/ossec/logs/archives/archives.json
+
+  FILTER BY AGENT:
+    sudo tail -f /var/ossec/logs/archives/archives.json | grep "<agent-name>"
+
+  FILTER BY LOCATION:
+    sudo tail -f /var/ossec/logs/archives/archives.json | grep "access_log\|catalina\|sysmon"
+
+Monitor only ALERTS:
+------------------------------------------------------------------------
+  COMMAND:
+    sudo tail -f /var/ossec/logs/alerts/alerts.json
+
+  PRETTY PRINT:
+    sudo tail -f /var/ossec/logs/alerts/alerts.json | python3 -m json.tool
+
+Monitor text alerts:
+------------------------------------------------------------------------
+  COMMAND:
+    sudo tail -f /var/ossec/logs/alerts/alerts.log
+
+--- 4.3 CHECK AGENT CONNECTIVITY ---
+
+List all connected agents:
+------------------------------------------------------------------------
+  COMMAND:
+    sudo /var/ossec/bin/agent_control -l
+
+  EXPECTED OUTPUT:
+    Wazuh agent_control. List of available agents:
+      ID: 000, Name: wazuh-manager (server), IP: 127.0.0.1, Active/Local
+      ID: 001, Name: ubuntu-tomcat, IP: 192.168.1.20, Active
+      ID: 002, Name: windows-ad, IP: 192.168.1.10, Active
+
+Check specific agent status:
+------------------------------------------------------------------------
+  COMMAND:
+    sudo /var/ossec/bin/agent_control -i <agent-id>
+
+  EXAMPLE:
+    sudo /var/ossec/bin/agent_control -i 001
+
+--- 4.4 CHECK MANAGER INTERNAL LOGS ---
+
+View manager logs for errors:
+------------------------------------------------------------------------
+  COMMAND:
+    sudo tail -f /var/ossec/logs/ossec.log
+
+  FILTER FOR LOGCOLLECTOR (log reading):
+    sudo grep "logcollector" /var/ossec/logs/ossec.log
+
+  FILTER FOR ANALYSISD (rule processing):
+    sudo grep "analysisd" /var/ossec/logs/ossec.log
+
+  FILTER FOR ERRORS:
+    sudo grep -i "error\|warn" /var/ossec/logs/ossec.log
+
+--- 4.5 VERIFY RULES ARE LOADED ---
+
+List all loaded rules:
+------------------------------------------------------------------------
+  COMMAND:
+    sudo /var/ossec/bin/wazuh-analysisd -t
+
+  OR check rules directory:
+    ls -la /var/ossec/etc/rules/
+
+  VERIFY CUSTOM RULES LOADED:
+    sudo grep -i "your-rule-name" /var/ossec/logs/ossec.log
+
+--- 4.6 RESTART MANAGER AFTER RULE CHANGES ---
+
+After adding/modifying rules:
+------------------------------------------------------------------------
+  COMMAND:
+    sudo systemctl restart wazuh-manager
+
+  VERIFY STATUS:
+    sudo systemctl status wazuh-manager
+
+  CHECK FOR CONFIG ERRORS:
+    sudo /var/ossec/bin/wazuh-analysisd -t
+
+================================================================================
+5. DASHBOARD - SEARCH QUERIES & FILTERS
+================================================================================
+
+--- 5.1 BASIC SEARCH QUERIES ---
+
+Search by Agent Name:
+  agent.name: ubuntu-tomcat
+  agent.name: windows-ad
+
+Search by Log Location:
+  location: /var/log/tomcat9/access_log
+  location: /var/log/audit/audit.log
+  location: Microsoft-Windows-Sysmon/Operational
+  location: Security
+
+Search by Event ID (Windows):
+  data.win.system.eventID: 1
+  data.win.system.eventID: 3
+  data.win.system.eventID: 4625
+  data.win.system.eventID: 4624
+  data.win.system.eventID: 4720
+  data.win.system.eventID: 1102
+
+Search by MITRE Technique:
+  rule.mitre.id: T1110
+  rule.mitre.id: T1059
+  rule.mitre.id: T1003
+
+Search by Rule Level:
+  rule.level: >= 10
+  rule.level: 5
+
+Search by Source IP:
+  srcip: 192.168.1.50
+  data.win.eventdata.ipAddress: 192.168.1.50
+
+--- 5.2 USEFUL FILTER COMBINATIONS ---
+
+Tomcat Access Logs Only:
+  location: /var/log/tomcat9/access_log AND agent.name: ubuntu-tomcat
+
+Sysmon Process Creation on Windows:
+  data.win.system.eventID: 1 AND location: Microsoft-Windows-Sysmon/Operational
+
+Failed RDP Logins:
+  data.win.system.eventID: 4625 AND data.win.eventdata.logonType: 10
+
+Auditd Process Monitoring:
+  location: /var/log/audit/audit.log AND data.audit.key: process_monitoring
+
+High Severity Alerts (Level 10+):
+  rule.level: >= 10
+
+--- 5.3 CREATE CUSTOM DASHBOARD PANELS ---
+
+1. Go to: Dashboard -> Create New Dashboard
+2. Click: Add Panel
+3. Select: Visualization type (e.g., Bar chart, Table)
+4. Configure:
+   - Index Pattern: wazuh-alerts-4.x-*
+   - Metrics: Count
+   - Buckets: X-Axis = Terms, Field = rule.description
+   - Filter: agent.name: <your-agent>
+5. Save Panel
+
+================================================================================
+6. MANUAL LOG INJECTION (TESTING WITHOUT REAL ATTACKS)
+================================================================================
+
+--- 6.1 LINUX: USING logger COMMAND ---
+
+Send fake syslog entries that Wazuh will pick up:
+------------------------------------------------------------------------
+  COMMAND:
+    logger -t sshd "Invalid user hacker from 192.168.1.50 port 12345"
+    logger -t sshd "Failed password for invalid user admin from 192.168.1.50 port 12345 ssh2"
+    logger -t sudo "user : user NOT in sudoers ; TTY=pts/0 ; PWD=/home/user ; USER=root ; COMMAND=/bin/bash"
+
+  VERIFY ON MANAGER:
+    sudo tail -f /var/ossec/logs/archives/archives.json | grep "sshd\|sudo"
+
+--- 6.2 LINUX: WRITE DIRECTLY TO SYSLOG ---
+
+  COMMAND:
+    echo "Jul 20 14:30:00 ubuntu sshd[12345]: Invalid user test from 10.0.0.1" | sudo tee -a /var/log/syslog
+
+  NOTE: Wazuh reads /var/log/syslog by default on Linux agents
+
+--- 6.3 WINDOWS: WRITE TO EVENT LOG (PowerShell) ---
+
+  COMMAND:
+    Write-EventLog -LogName Application -Source "TestSource" -EventId 1001 -EntryType Warning -Message "Test event for Wazuh"
+
+  NOTE: May need to create event source first:
+    New-EventLog -LogName Application -Source "TestSource"
+
+--- 6.4 MANAGER: DIRECT LOG TESTING WITH wazuh-logtest ---
+
+Best method for testing Sigma rules:
+
+  1. Find a real log sample from your environment
+  2. SSH to manager
+  3. Run: sudo /var/ossec/bin/wazuh-logtest
+  4. Paste the log line
+  5. Check if your custom rule fires
+
+EXAMPLE LOG SAMPLES FOR TESTING:
+
+Tomcat (Apache format):
+  192.168.1.100 - - [20/Jul/2026:14:30:00 +0000] "GET /manager/html HTTP/1.1" 401 1234
+  192.168.1.100 - - [20/Jul/2026:14:30:01 +0000] "PUT /manager/html/upload?org.apache.catalina.filters.CSRF_NONCE=... HTTP/1.1" 200 -
+
+Windows Security (Event ID 4625):
+  (Use wazuh-logtest with eventchannel format - best to trigger real event)
+
+Auditd:
+  type=SYSCALL msg=audit(1721488200.123:12345): arch=c000003e syscall=59 success=yes exit=0 a0=... a1=... a2=... a3=... items=2 ppid=... pid=... auid=... uid=... gid=... euid=... suid=... fsuid=... egid=... sgid=... fsgid=... tty=pts0 ses=... comm="bash" exe="/bin/bash" key="process_monitoring"
+
+================================================================================
+7. SIGMA RULE TESTING WORKFLOW
+================================================================================
+
+--- 7.1 BEFORE CONVERTING A SIGMA RULE ---
+
+STEP 1: Understand what the Sigma rule detects
+  - Read the Sigma YAML file
+  - Note the logsource, detection logic, and MITRE mapping
+
+STEP 2: Find a real log sample that should trigger the rule
+  - Generate the activity on the agent
+  - Capture the exact log line
+
+STEP 3: Test the log sample with wazuh-logtest
+  - Verify it decodes correctly
+  - Note which fields are extracted
+
+--- 7.2 AFTER CONVERTING SIGMA TO WAZUH XML ---
+
+STEP 1: Deploy the rule to manager
+  sudo cp your_rule.xml /var/ossec/etc/rules/
+  sudo systemctl restart wazuh-manager
+
+STEP 2: Test with wazuh-logtest
+  sudo /var/ossec/bin/wazuh-logtest
+  # Paste your log sample
+
+STEP 3: Verify rule fires
+  - Look for your rule ID in the output
+  - Check the alert level matches your expectation
+
+STEP 4: Generate real traffic on agent
+  - Run the actual command/attack
+  - Verify alert appears in dashboard
+
+STEP 5: Verify dashboard shows correct fields
+  - Check all extracted fields are visible
+  - Verify MITRE technique is mapped
+
+--- 7.3 COMMON ISSUES AND FIXES ---
+
+ISSUE: Rule doesn't fire in wazuh-logtest
+  CHECK:
+    1. Is the decoder extracting the right field?
+    2. Does the field name in the rule match the decoded field?
+    3. Is the parent rule (if_sid) correct and loaded?
+    4. Are there syntax errors in the XML?
+
+ISSUE: Rule fires in logtest but not on real agent
+  CHECK:
+    1. Is the agent sending logs? (check agent_control -l)
+    2. Is the log location correct in ossec.conf?
+    3. Are there permission issues reading the log file?
+    4. Is the manager processing the logs? (check ossec.log)
+
+ISSUE: Wrong alert level
+  CHECK:
+    1. Is there a higher-level rule overriding yours?
+    2. Check rule ordering in the XML files
+
+================================================================================
+8. TROUBLESHOOTING CHECKLIST
+================================================================================
+
+--- AGENT NOT SENDING LOGS ---
+
+[ ] Agent service running?
+    Linux:   sudo systemctl status wazuh-agent
+    Windows: Get-Service wazuh
+
+[ ] Agent connected to manager?
+    Manager: sudo /var/ossec/bin/agent_control -l
+
+[ ] Correct log path in ossec.conf?
+    Linux:   sudo cat /var/ossec/etc/ossec.conf | grep -A 3 "localfile"
+    Windows: Get-Content "C:\Program Files (x86)\ossec-agent\ossec.conf"
+
+[ ] Log file exists and readable?
+    Linux:   ls -la /var/log/<logfile>
+    Windows: Get-WinEvent -ListLog <log-name>
+
+[ ] Agent logs show errors?
+    Linux:   sudo cat /var/ossec/logs/ossec.log | grep -i error
+    Windows: Get-Content "C:\Program Files (x86)\ossec-agent\ossec.log"
+
+[ ] Firewall blocking port 1514/udp?
+    Manager: sudo netstat -tulpn | grep 1514
+    Agent:   Test connectivity to manager IP on port 1514
+
+--- LOGS REACH MANAGER BUT NO ALERTS ---
+
+[ ] Logs in archives.json?
+    sudo tail /var/ossec/logs/archives/archives.json | grep <agent-name>
+
+[ ] Decoding correctly?
+    Test with wazuh-logtest
+
+[ ] Rule loaded?
+    sudo ls -la /var/ossec/etc/rules/
+    sudo grep "your-rule-id" /var/ossec/etc/rules/*.xml
+
+[ ] Manager restarted after rule change?
+    sudo systemctl restart wazuh-manager
+
+[ ] Rule syntax valid?
+    sudo /var/ossec/bin/wazuh-analysisd -t
+
+--- DASHBOARD NOT SHOWING DATA ---
+
+[ ] Index pattern exists?
+    Stack Management -> Index Patterns -> wazuh-alerts-4.x-*
+
+[ ] Time range correct?
+    Check top-right time picker in dashboard
+
+[ ] Filters too restrictive?
+    Clear all filters and try again
+
+[ ] API connection working?
+    Left menu -> Wazuh -> Status
+
+================================================================================
+9. QUICK COMMAND CHEAT SHEET
+================================================================================
+
+--- UBUNTU AGENT ---
+
+Restart agent:
+  sudo systemctl restart wazuh-agent
+
+Check agent status:
+  sudo systemctl status wazuh-agent
+
+View agent logs:
+  sudo tail -f /var/ossec/logs/ossec.log
+
+Check agent config:
+  sudo cat /var/ossec/etc/ossec.conf
+
+Generate Tomcat traffic:
+  curl http://localhost:8080/
+
+Generate auditd events:
+  whoami; ls -la; ps aux
+
+View audit logs:
+  sudo tail -f /var/log/audit/audit.log
+
+View Tomcat access logs:
+  sudo tail -f /var/log/tomcat9/access_log.*
+
+View Tomcat catalina logs:
+  sudo tail -f /var/log/tomcat9/catalina.out
+
+--- WINDOWS AGENT ---
+
+Restart agent:
+  Restart-Service -Name wazuh
+
+Check agent status:
+  Get-Service wazuh
+
+Check Sysmon status:
+  Get-Service Sysmon64
+
+View agent logs:
+  Get-Content "C:\Program Files (x86)\ossec-agent\ossec.log" -Tail 50
+
+Check agent config:
+  Get-Content "C:\Program Files (x86)\ossec-agent\ossec.conf"
+
+Generate Sysmon events:
+  whoami; ipconfig /all; net user
+
+View Sysmon events:
+  Get-WinEvent -LogName Microsoft-Windows-Sysmon/Operational -MaxEvents 10
+
+View Security events:
+  Get-WinEvent -LogName Security -MaxEvents 10
+
+--- WAZUH MANAGER ---
+
+Restart manager:
+  sudo systemctl restart wazuh-manager
+
+Check manager status:
+  sudo systemctl status wazuh-manager
+
+Test rules:
+  sudo /var/ossec/bin/wazuh-logtest
+
+List agents:
+  sudo /var/ossec/bin/agent_control -l
+
+Check agent details:
+  sudo /var/ossec/bin/agent_control -i <agent-id>
+
+Monitor all logs:
+  sudo tail -f /var/ossec/logs/archives/archives.json
+
+Monitor alerts:
+  sudo tail -f /var/ossec/logs/alerts/alerts.json
+
+Monitor text alerts:
+  sudo tail -f /var/ossec/logs/alerts/alerts.log
+
+Check manager errors:
+  sudo tail -f /var/ossec/logs/ossec.log
+
+Verify rule syntax:
+  sudo /var/ossec/bin/wazuh-analysisd -t
+
+List custom rules:
+  ls -la /var/ossec/etc/rules/
+
+Search for rule:
+  sudo grep -r "rule-id" /var/ossec/etc/rules/
+
+--- DASHBOARD ---
+
+URL:
+  https://<manager-ip>:5601
+
+Security Events:
+  Modules -> Security Events
+
+Agents:
+  Management -> Agents
+
+Rules:
+  Management -> Rules
+
+Decoders:
+  Management -> Decoders
+
+Search by agent:
+  agent.name: <name>
+
+Search by event ID:
+  data.win.system.eventID: <id>
+
+Search by location:
+  location: <log-path>
+
+Search by MITRE:
+  rule.mitre.id: <technique>
+
+Search by level:
+  rule.level: >= 10
+
+================================================================================
+  END OF DOCUMENT
+================================================================================
