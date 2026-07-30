@@ -1,7 +1,3 @@
-id=100100
-
-
-
 from utils import build_chroma_filter
 from langchain_chroma import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -25,10 +21,9 @@ result = collection.get(
     where={
         "$and": [
             {"type": {"$eq": "rule"}},
-            {"id": {"$eq": 100100}}
+            {"id": {"$eq": 80700}}
         ]
     }
 )
 
 print(result)
-

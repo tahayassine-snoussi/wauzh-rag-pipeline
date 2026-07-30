@@ -125,9 +125,9 @@ def _patterns_overlap(sigma_values: list[str], existing_pattern: str) -> bool:
 
 def find_parent_rule(platform: str, parent_signature: dict, db, k: int = 10, decoder_name: str | None = None) -> Document | None:
     base_sid = "80700"
-    filter_dict = {"type": "rule", "platform": platform, "rule_level": {"$lte": 2}}
+    filter_dict = {"type": "rule", "platform": platform}
     chroma_filter = build_chroma_filter(filter_dict)
-    results = db.similarity_search("", k=k, filter=chroma_filter)
+    results = db.similarity_search("", k=k * 3, filter=chroma_filter)
 
     logger.info(f"[Category C] Searching DB for parent baseline with filter: {filter_dict}")
 
@@ -168,9 +168,17 @@ def find_parent_rule(platform: str, parent_signature: dict, db, k: int = 10, dec
                 sig_base = sig_key.split("|")[0]
                 wazuh_candidates = get_wazuh_field_candidates(sig_base, platform, "auditd")
                 if any(normalize_field(c) == normalize_field(field_name) for c in wazuh_candidates):
-                    if isinstance(sig_values, list) and _token_basename_overlap(sig_values, pattern):
-                        score += 1
-                        matched_patterns.append(pattern)
+                    if isinstance(sig_values, list):
+                        # Handle list-of-lists (contains|all groups) vs flat list
+                        if sig_values and isinstance(sig_values[0], list):
+                            flat_values = [v for group in sig_values for v in group]
+                            if _token_basename_overlap(flat_values, pattern):
+                                score += 1
+                                matched_patterns.append(pattern)
+                        else:
+                            if _token_basename_overlap(sig_values, pattern):
+                                score += 1
+                                matched_patterns.append(pattern)
 
         logger.info(f"[Category C] Candidate {rule_id}: overlap_score={score}, patterns={matched_patterns}")
 
@@ -203,34 +211,37 @@ def _find_generic_process_parent(platform: str, db, k: int = 10) -> Document | N
     return None
 
 
-def _extract_parent_signatures(sigma: dict) -> dict:
+def _extract_parent_signatures(sigma: dict) -> list[dict]:
     detection = sigma.get("detection", {})
-    unified: dict[str, list] = {}
-
-    def _collect(obj):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                base = k.split("|")[0]
-                if base in ("ParentImage", "ParentCommandLine"):
-                    vals = v if isinstance(v, list) else [v]
-                    if k in unified:
-                        existing = set(unified[k])
-                        existing.update(vals)
-                        unified[k] = list(existing)
-                    else:
-                        unified[k] = list(vals)
-                else:
-                    _collect(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                _collect(item)
+    signatures = []
 
     for key, value in detection.items():
         if key == "condition":
             continue
+        sig = {}
+        def _collect(obj):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    base = k.split("|")[0]
+                    if base in ("ParentImage", "ParentCommandLine"):
+                        sig[k] = v if isinstance(v, list) else [v]
+                    else:
+                        _collect(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _collect(item)
         _collect(value)
+        if sig:
+            signatures.append(sig)
 
-    return unified
+    unique = []
+    seen = set()
+    for sig in signatures:
+        frozen = tuple(sorted((k, tuple(sorted(v if isinstance(v, list) else [v]))) for k, v in sig.items()))
+        if frozen not in seen:
+            seen.add(frozen)
+            unique.append(sig)
+    return unique
 
 
 def _extract_child_signatures(sigma: dict) -> dict:
@@ -257,9 +268,86 @@ def _extract_child_signatures(sigma: dict) -> dict:
     return child_sig
 
 
+def _build_contains_all_regex(groups: list[list[str]]) -> str:
+    """Build a single PCRE2 regex from multiple contains|all groups that are OR'd together."""
+    if not groups:
+        return ""
+
+    def esc(s: str) -> str:
+        return re.escape(s)
+
+    if len(groups) == 1:
+        parts = [f"(?=.*{esc(v)})" for v in groups[0]]
+        return "(?i)" + "".join(parts)
+
+    group_parts = []
+    for group in groups:
+        parts = [f"(?=.*{esc(v)})" for v in group]
+        group_parts.append("".join(parts))
+
+    return "(?i)(?:" + "|".join(group_parts) + ")"
+
+
 def _generate_rule_id(platform: str, idx: int = 0) -> str:
     return f"9{platform[:3].upper()}{idx + 1:03d}"
 
+
+def _build_specific_parent_xml(sig: dict, rule_id: str, base_if_sid: str, platform: str, decoder_name: str) -> str:
+    # Parent fields have known mappings; don't rely on generic lookup that may return ppid/uid junk
+    PARENT_FIELD_MAP = {
+        "ParentImage": "audit.exe",
+        "ParentCommandLine": "audit.command",
+    }
+
+    fields_xml = []
+    for sigma_key, values in sig.items():
+        base = sigma_key.split("|")[0]
+        modifier = "|".join(sigma_key.split("|")[1:]) if "|" in sigma_key else ""
+        wf = PARENT_FIELD_MAP.get(base)
+        if not wf:
+            # Fallback to generic lookup only for unknowns
+            candidates = get_wazuh_field_candidates(base, platform, decoder_name)
+            wf = candidates[0] if candidates else None
+        if not wf:
+            continue
+
+        vals = values if isinstance(values, list) else [values]
+
+        if modifier == "endswith":
+            escaped = "|".join(re.escape(v) for v in vals)
+            pattern = f"(?i)(?:{escaped})$"
+        elif modifier == "contains|all":
+            parts = [f"(?=.*{re.escape(v)})" for v in vals]
+            pattern = "(?i)" + "".join(parts)
+        elif modifier == "contains":
+            escaped = "|".join(re.escape(v) for v in vals)
+            pattern = f"(?i)(?:{escaped})"
+        else:
+            escaped = "|".join(re.escape(v) for v in vals)
+            pattern = f"(?i)(?:{escaped})"
+
+        fields_xml.append(f'    <field name="{wf}">{pattern}</field>')
+
+    if not fields_xml:
+        raise PipelineError(f"Specific parent {rule_id} has no fields; signature was {sig}")
+
+    fields_block = "\n".join(fields_xml)
+    return f'''<group name="{platform}_parent_baseline">
+  <rule id="{rule_id}" level="0">
+    <if_sid>{base_if_sid}</if_sid>
+{fields_block}
+  </rule>
+</group>'''
+
+
+def _build_meta_parent_xml(rule_id: str, parent_ids: list[str], platform: str) -> str:
+    if_sid_list = ",".join(parent_ids)
+    return f'''<group name="{platform}_meta_parent">
+  <rule id="{rule_id}" level="0">
+    <if_sid>{if_sid_list}</if_sid>
+    <description>Meta-parent: fires if any specific parent baseline matched</description>
+  </rule>
+</group>'''
 
 # =============================================================================
 # Category C Correlation Handler
@@ -291,14 +379,23 @@ def _build_category_c_prompt(
             candidate_text += f"\n{xml}\n"
 
     sig_lines = []
+    prebuilt_regexes: dict[str, str] = {}
     for sig_key, sig_values in parent_signature.items():
         base_field = sig_key.split("|")[0]
         modifier = "|".join(sig_key.split("|")[1:]) if "|" in sig_key else "equals"
-        val_str = repr(sig_values)
-        sig_lines.append(f"- {base_field} ({modifier}): {val_str}")
+
+        if modifier == "contains|all" and isinstance(sig_values, list) and sig_values and isinstance(sig_values[0], list):
+            # Multiple AND groups that are OR'd together
+            for i, group in enumerate(sig_values, 1):
+                sig_lines.append(f"- {base_field} ({modifier}) [Group {i}]: {repr(group)}")
+            regex = _build_contains_all_regex(sig_values)
+            prebuilt_regexes[base_field] = regex
+            sig_lines.append(f"  -> PRE-BUILT PCRE2 REGEX (use this exact pattern): {regex}")
+        else:
+            val_str = repr(sig_values)
+            sig_lines.append(f"- {base_field} ({modifier}): {val_str}")
 
     structured_signature = "\n".join(sig_lines)
-
     prompt = f"""You are an expert Wazuh detection engineer. This Sigma rule requires PARENT-CHILD CORRELATION.
 
 ORIGINAL SIGMA RULE:
@@ -384,7 +481,7 @@ def _extract_tagged_xml(output: str, tag: str) -> str | None:
 
 
 def _extract_rule_id(xml_string: str) -> str | None:
-    match = re.search(r'<rule\s+id="(\d+)"', xml_string)
+    match = re.search(r'<rule\s+id="([^"]+)"', xml_string)
     if match:
         return match.group(1)
     return None
@@ -417,6 +514,7 @@ def _is_duplicate_parent(new_xml: str, existing_xmls: list[str]) -> tuple[bool, 
             return True, ex_id
     return False, None
 
+
 @retry_on_error(max_retries=3, backoff=2)
 def _llm_generate_category_c(prompt: str) -> str:
     interaction = GROQ_CLIENT.chat.completions.create(
@@ -442,144 +540,197 @@ def handle_parent_child_correlation(
 
     logger.info("[Category C] Handling parent-child correlation...")
 
-    decoder_doc, resolution_log = resolve_decoder(
-        platform, service, category, expected_decoder, sigma_fields, db
-    )
+    decoder_doc, resolution_log = resolve_decoder(platform, service, category, expected_decoder, sigma_fields, db)
 
     actual_decoder = resolution_log.get("selected_decoder") or expected_decoder
     if decoder_doc:
         actual_decoder = decoder_doc.metadata.get("decoder_name", actual_decoder)
 
-    field_mapping_text = _build_field_mapping_prompt_block(
-        sigma_fields, platform, actual_decoder
-    )
+    parent_signatures = _extract_parent_signatures(sigma)
+    logger.info(f"[Category C] Extracted {len(parent_signatures)} parent signature(s): {parent_signatures}")
 
-    parent_signature = _extract_parent_signatures(sigma)
-    logger.info(f"[Category C] Extracted unified parent signature: {parent_signature}")
-
-    parent_candidates = []
-    candidate = find_parent_rule(platform, parent_signature, db, decoder_name=actual_decoder)
-    if candidate:
-        parent_candidates.append(candidate)
-
+    # Base rule for parent hierarchy
     base_if_sid = "80700"
     generic_parent = _find_generic_process_parent(platform, db)
     if generic_parent:
         generic_id = generic_parent.metadata.get("rule_id")
-        logger.info(f"[Category C] Using generic process parent {generic_id} as base for new specific parent.")
+        logger.info(f"[Category C] Using generic process parent {generic_id} as base.")
         base_if_sid = generic_id
     else:
-        logger.info("[Category C] No generic process parent found, falling back to base rule 80700.")
+        logger.info("[Category C] No generic process parent found, falling back to 80700.")
 
-    parent_id = _generate_rule_id(platform, 0)
-    child_id = _generate_rule_id(platform, 1)
-    logger.info(f"[Category C] Assigned IDs: parent={parent_id}, child={child_id}")
-
+    # Resolve each specific parent (existing DB match OR generate new)
+    specific_parents = []   # {"rule_id": str, "xml": str|None, "source": str}
     existing_parent_xmls = []
+    next_idx = 0
 
-    prompt = _build_category_c_prompt(
-        yaml_rule, sigma_info, field_mapping_text, parent_candidates,
-        existing_parent_xmls, parent_id, child_id, parent_signature, base_if_sid
-    )
+    for sig_idx, sig in enumerate(parent_signatures):
+        logger.info(f"[Category C] Resolving signature {sig_idx+1}/{len(parent_signatures)}: {sig}")
 
-    logger.info("[Category C] Prompt built, calling LLM...")
-    output = _llm_generate_category_c(prompt)
-    logger.info(f"[Category C] Raw LLM output length: {len(output)}")
+        candidate = find_parent_rule(platform, sig, db, decoder_name=actual_decoder)
+        if candidate:
+            cid = candidate.metadata.get("rule_id", "unknown")
+            logger.info(f"[Category C] Found existing parent {cid} for signature {sig_idx+1}")
+            specific_parents.append({
+                "rule_id": cid,
+                "xml": candidate.page_content,
+                "source": "existing"
+            })
+            existing_parent_xmls.append(candidate.page_content)
+            continue
 
-    # Enforce deterministic IDs and base if_sid
-    output = re.sub(r'(<rule\s+id=")\d+(")', rf'\g<1>{parent_id}\g<2>', output, count=1)
-    output = re.sub(r'(<rule\s+id=")\d+(")', rf'\g<1>{child_id}\g<2>', output)
-    output = re.sub(r'(<if_matched_sid>)\d+(</if_matched_sid>)', rf'\g<1>{parent_id}\g<2>', output)
-    output = re.sub(r'(<if_sid>)\d+(</if_sid>)', rf'\g<1>{base_if_sid}\g<2>', output)
+        # Generate new specific parent
+        pid = _generate_rule_id(platform, next_idx)
+        next_idx += 1
+        logger.info(f"[Category C] Generating new specific parent {pid} for signature {sig_idx+1}")
 
-    parent_xml = _extract_tagged_xml(output, "PARENT RULE")
-    child_xml = _extract_tagged_xml(output, "CHILD RULE")
+        parent_xml = _build_specific_parent_xml(sig, pid, base_if_sid, platform, actual_decoder)
 
-    logger.info(f"[Category C] Extracted parent XML: {parent_xml is not None}, child XML: {child_xml is not None}")
+        # Dedup against existing + previously generated in this run
+        all_existing_xmls = [p["xml"] for p in specific_parents if p["xml"]] + existing_parent_xmls
+        is_dup, dup_id = _is_duplicate_parent(parent_xml, all_existing_xmls)
+        if is_dup:
+            logger.info(f"[Category C] Specific parent {pid} is duplicate of {dup_id}, reusing.")
+            specific_parents.append({
+                "rule_id": dup_id,
+                "xml": None,
+                "source": "deduplicated"
+            })
+        else:
+            specific_parents.append({
+                "rule_id": pid,
+                "xml": parent_xml,
+                "source": "generated"
+            })
 
-    if not parent_xml or not child_xml:
-        raise XMLExtractionError(
-            f"Category C LLM output did not contain both PARENT and CHILD rules. Output:\n{output[:500]}"
-        )
+    active_specific_ids = list(dict.fromkeys(
+        p["rule_id"] for p in specific_parents if p["rule_id"]
+    ))
+    if not active_specific_ids:
+        raise PipelineError("No valid specific parent IDs available for meta-parent construction")
+    
+    
+    # Meta-parent ORs all specific parents
+    meta_idx = next_idx
+    meta_id = _generate_rule_id(platform, meta_idx)
+    next_idx = meta_idx + 1
+    meta_xml = _build_meta_parent_xml(meta_id, active_specific_ids, platform)
+    logger.info(f"[Category C] Meta-parent {meta_id} grouping: {active_specific_ids}")
 
-    all_existing_xmls = [p.page_content for p in parent_candidates] + existing_parent_xmls
-    is_dup, existing_id = _is_duplicate_parent(parent_xml, all_existing_xmls)
+    # Child rule
+    child_idx = next_idx
+    child_id = _generate_rule_id(platform, child_idx)
+    logger.info(f"[Category C] Assigned IDs: meta={meta_id}, child={child_id}")
 
-    if is_dup:
-        logger.info(f"[Category C] Parent discovery result: deduplicated_to_id={existing_id}")
-        parent_xml = None
-        parent_id = existing_id
-    else:
-        logger.info(f"[Category C] Parent discovery result: generated_new (base_if_sid={base_if_sid})")
+    child_sig = _extract_child_signatures(sigma)
+    child_fields_xml = []
+    for sigma_key, values in child_sig.items():
+        modifier = "|".join(sigma_key.split("|")[1:]) if "|" in sigma_key else ""
+        wazuh_fields = get_wazuh_field_candidates(sigma_key.split("|")[0], platform, actual_decoder)
+        if not wazuh_fields:
+            continue
+        wf = wazuh_fields[0]
+        vals = values if isinstance(values, list) else [values]
 
+        if modifier == "endswith":
+            escaped = "|".join(re.escape(v) for v in vals)
+            pattern = f"(?i)(?:{escaped})$"
+        elif modifier == "contains|all":
+            parts = [f"(?=.*{re.escape(v)})" for v in vals]
+            pattern = "(?i)" + "".join(parts)
+        elif modifier == "contains":
+            escaped = "|".join(re.escape(v) for v in vals)
+            pattern = f"(?i)(?:{escaped})"
+        else:
+            escaped = "|".join(re.escape(v) for v in vals)
+            pattern = f"(?i)(?:{escaped})"
+        child_fields_xml.append(f'    <field name="{wf}">{pattern}</field>')
+
+    level = sigma_info.get("level", "high")
+    child_xml = f'''<group name="{platform}_detection">
+  <rule id="{child_id}" level="{level}">
+    <if_matched_sid>{meta_id}</if_matched_sid>
+{chr(10).join(child_fields_xml)}
+    <frequency>1</frequency>
+    <timeframe>60</timeframe>
+  </rule>
+</group>'''
+
+    logger.info(f"[Category C] Extracted specific parents: {len([p for p in specific_parents if p['xml']])} new, meta XML: True, child XML: True")
+
+    # Validation
     validator = ValidatorAgent(db)
 
-    if parent_xml:
-        validator.add_in_memory_parent(Document(
-            page_content=parent_xml,
-            metadata={"rule_id": parent_id, "platform": platform, "rule_level": 0, "has_children": True}
-        ))
-        existing_parent_xmls.append(parent_xml)
+    for p in specific_parents:
+        if p["xml"]:
+            validator.add_in_memory_parent(Document(
+                page_content=p["xml"],
+                metadata={"rule_id": p["rule_id"], "platform": platform, "rule_level": 0, "has_children": True}
+            ))
+    validator.add_in_memory_parent(Document(
+        page_content=meta_xml,
+        metadata={"rule_id": meta_id, "platform": platform, "rule_level": 0, "has_children": True}
+    ))
 
-    is_valid_parent = True
-    parent_reviews = []
-    if parent_xml:
-        is_valid_parent, parent_reviews = validator.validate(parent_xml, platform, actual_decoder)
-        collision_ok, collision_msg = validator._validate_field_collisions(parent_xml)
-        if not collision_ok:
-            is_valid_parent = False
-            parent_reviews.append(collision_msg)
+    all_reviews = []
 
-    is_valid_child, child_reviews = validator.validate(child_xml, platform, actual_decoder)
-    collision_ok, collision_msg = validator._validate_field_collisions(child_xml)
-    if not collision_ok:
-        is_valid_child = False
-        child_reviews.append(collision_msg)
+    for p in specific_parents:
+        if p["xml"]:
+            v, rev = validator.validate(p["xml"], platform, actual_decoder)
+            if not v:
+                all_reviews.extend(rev)
+            coll_ok, coll_msg = validator._validate_field_collisions(p["xml"])
+            if not coll_ok:
+                all_reviews.append(coll_msg)
 
+    v, rev = validator.validate(meta_xml, platform, actual_decoder)
+    if not v:
+        all_reviews.extend(rev)
+
+    v, rev = validator.validate(child_xml, platform, actual_decoder)
+    if not v:
+        all_reviews.extend(rev)
+    coll_ok, coll_msg = validator._validate_field_collisions(child_xml)
+    if not coll_ok:
+        all_reviews.append(coll_msg)
     purity_ok, purity_msg = validator._validate_child_rule_purity(child_xml)
     if not purity_ok:
-        is_valid_child = False
-        child_reviews.append(purity_msg)
-
+        all_reviews.append(purity_msg)
     matched_ok, matched_msg = validator._validate_if_matched_sid(child_xml)
     if not matched_ok:
-        is_valid_child = False
-        child_reviews.append(matched_msg)
+        all_reviews.append(matched_msg)
 
-    all_reviews = parent_reviews + child_reviews
-    is_valid = is_valid_parent and is_valid_child and len(all_reviews) == 0
+    is_valid = len(all_reviews) == 0
 
-    fidelity_ok, fidelity_msg = validator._validate_category_c_fidelity(sigma, [parent_xml, child_xml])
+    fidelity_ok, fidelity_msg = validator._validate_category_c_fidelity(
+        sigma,
+        [p["xml"] for p in specific_parents if p["xml"]] + [meta_xml, child_xml]
+    )
     if not fidelity_ok:
         is_valid = False
         all_reviews.append(fidelity_msg)
 
+    # Build output
     rules_output = []
-    if parent_xml:
-        rules_output.append({
-            "rule_id": parent_id,
-            "xml": parent_xml,
-            "type": "parent_baseline"
-        })
-    else:
-        rules_output.append({
-            "rule_id": parent_id,
-            "xml": next((p.page_content for p in parent_candidates if p.metadata.get("rule_id") == parent_id), ""),
-            "type": "parent_baseline"
-        })
+    for p in specific_parents:
+        if p["xml"]:
+            rules_output.append({"rule_id": p["rule_id"], "xml": p["xml"], "type": "parent_baseline"})
+        elif p["source"] == "existing":
+            rules_output.append({"rule_id": p["rule_id"], "xml": p.get("xml", ""), "type": "parent_baseline"})
 
+    rules_output.append({"rule_id": meta_id, "xml": meta_xml, "type": "meta_parent"})
     rules_output.append({
         "rule_id": child_id,
         "xml": child_xml,
         "type": "detection",
-        "if_matched_sid": parent_id
+        "if_matched_sid": meta_id
     })
 
     logger.info("=" * 60)
     logger.info("CATEGORY C OUTPUT SUMMARY")
     logger.info("=" * 60)
     for r in rules_output:
-        logger.info(f"Rule {r['rule_id']} ({r['type']}):\n{r['xml'][:200]}...")
+        logger.info(f"Rule {r['rule_id']} ({r['type']}):\n{r['xml']}")
     logger.info(f"Validation: {'PASSED' if is_valid else 'FAILED'}")
     if all_reviews:
         for rev in all_reviews:
@@ -593,6 +744,7 @@ def handle_parent_child_correlation(
         "is_valid": is_valid,
         "reviews": all_reviews
     }
+
 
 # =============================================================================
 # Existing retrieval / conversion functions
@@ -642,6 +794,7 @@ def _token_basename_overlap(sigma_values: list[str], existing_pattern: str) -> b
             existing_tokens.add(basename)
 
     return bool(sigma_tokens & existing_tokens)
+
 
 def retrieve_filtered(query: str, platform: str, db, k: int = 5) -> list[Document]:
     filter_dict = {"type": "rule"}

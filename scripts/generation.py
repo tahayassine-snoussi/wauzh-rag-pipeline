@@ -11,6 +11,7 @@ from utils import (
     DB, GROQ_CLIENT, LLM_CONFIG, MAX_ITERATIONS,
     retry_on_error, XMLExtractionError,
 )
+
 from pipeline import (
     classify_sigma_rule,
     classify_process_correlation,
@@ -287,10 +288,19 @@ level: high
     # =====================================================================
     correlation_category = classify_process_correlation(sigma)
     logger.info(f"Process correlation classification: {correlation_category}")
-
     if correlation_category == "C":
         logger.info(">>> CATEGORY C DETECTED — bypassing single-rule path <<<")
         result = handle_parent_child_correlation(sigma, sigma_info, yaml_rule, DB)
+
+        logger.info("=" * 60)
+        logger.info("CATEGORY C FULL RESULTS")
+        logger.info("=" * 60)
+        for rule in result.get("rules", []):
+            logger.info(f"--- {rule['rule_id']} ({rule['type']}) ---")
+            logger.info(rule.get("xml", ""))
+            logger.info("")
+        logger.info("=" * 60)
+
         return result
 
     # =====================================================================
